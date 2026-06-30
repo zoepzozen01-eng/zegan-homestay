@@ -73,10 +73,7 @@ export default function Footer({ lang }: FooterProps) {
                   {t.fullAddress}
                 </span>
               </div>
-              <div className="flex items-center gap-2.5 text-brand-200/80">
-                <Compass className="w-4 h-4 text-brand-300 shrink-0" />
-                <span className="font-light">Nanggulan, Yogyakarta, Indonesia</span>
-              </div>
+
             </div>
           </div>
 

@@ -57,7 +57,7 @@ export interface AddOn {
   };
 }
 
-export type BookingStatus = 'Pending' | 'Waiting Verification' | 'Paid' | 'Checked In' | 'Completed' | 'Cancelled' | 'Expired';
+export type BookingStatus = 'Pending' | 'Waiting Verification' | 'Paid' | 'Checked In' | 'CheckedIn' | 'Completed' | 'Cancelled' | 'Expired';
 export type PaymentStatus = 'Pending' | 'Waiting Verification' | 'Paid' | 'Expired';
 export type UserRole = 'Admin' | 'Receptionist' | 'Owner';
 

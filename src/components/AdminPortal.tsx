@@ -83,6 +83,8 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
     { id: 'd3296e6b-a5c5-4db5-ac9a-81664eb41d36', number: 'Rumah-1', type: 'Rumah', status: 'Available', room_type_id: 'e8f31a0b-052a-4b29-8a93-06e8013fa623' }
   ]);
 
+  const [loadingRooms, setLoadingRooms] = useState<Record<string, boolean>>({});
+
   const calendarRoomsList = dbRooms;
 
   // Fetch rooms from Supabase
@@ -90,7 +92,7 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
     try {
       const { data, error } = await supabase
         .from('rooms')
-        .select('id, room_number, status, room_type_id, room_types(name)')
+        .select('id, room_number, status, room_type_id, occupied_until, room_types(name)')
         .order('room_number', { ascending: true });
 
       if (error) {
@@ -103,7 +105,8 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
           number: r.room_number,
           type: r.room_types?.name || 'Unknown Room',
           status: r.status,
-          room_type_id: r.room_type_id
+          room_type_id: r.room_type_id,
+          occupied_until: r.occupied_until
         }));
         
         // Custom sorting to make sure numeric order works and Rumah-1 is at the end
@@ -113,9 +116,139 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
           return a.number.localeCompare(b.number, undefined, { numeric: true, sensitivity: 'base' });
         });
         setDbRooms(mapped);
+
+        // Fetch bookings after rooms are loaded so we can map room numbers
+        await fetchDbBookings(mapped);
       }
     } catch (err) {
       console.error('Error fetching rooms from database:', err);
+    }
+  };
+
+  // Fetch real-time bookings from Supabase and map/sync
+  const fetchDbBookings = async (roomsList = dbRooms) => {
+    try {
+      const { data, error } = await supabase
+        .from('bookings')
+        .select(`
+          booking_code,
+          room_id,
+          check_in,
+          check_out,
+          adults,
+          total_price,
+          special_request,
+          payment_status,
+          booking_status,
+          admin_notification_sent,
+          created_at,
+          guests (
+            id,
+            full_name,
+            phone,
+            email
+          )
+        `);
+
+      if (error) {
+        console.warn('Failed to fetch bookings from database, using local backups.', error);
+        return;
+      }
+
+      if (data) {
+        const mappedBookings: Booking[] = data.map((b: any) => {
+          const guestObj = b.guests;
+          const guest = Array.isArray(guestObj) ? guestObj[0] : guestObj;
+          const roomObj = roomsList.find(r => r.id === b.room_id);
+          
+          return {
+            booking_code: b.booking_code,
+            room_id: b.room_id,
+            room_name: roomObj ? roomObj.type : 'Kamar Zegan',
+            room_number: roomObj ? roomObj.number : '',
+            check_in: b.check_in,
+            check_out: b.check_out,
+            guests: b.adults || 1,
+            full_name: guest?.full_name || 'Tamu',
+            email: guest?.email || '',
+            phone: guest?.phone || '',
+            special_requests: b.special_request || '',
+            total_price: b.total_price || 0,
+            status: b.booking_status || 'Pending',
+            payment_status: b.payment_status || 'Pending',
+            created_at: b.created_at || new Date().toISOString()
+          };
+        });
+
+        setBookings(mappedBookings);
+        localStorage.setItem('zegan_bookings', JSON.stringify(mappedBookings));
+      }
+    } catch (err) {
+      console.error('Error in fetchDbBookings:', err);
+    }
+  };
+
+  // Handle Check-in action for a booked (KUNING) room
+  const handleCheckInBooking = async (roomObj: any, activeBooking: any) => {
+    if (loadingRooms[roomObj.id]) return;
+
+    setLoadingRooms(prev => ({ ...prev, [roomObj.id]: true }));
+    try {
+      // 1. Update booking_status to 'CheckedIn' in Supabase bookings table
+      const { error: bookingError } = await supabase
+        .from('bookings')
+        .update({ booking_status: 'CheckedIn' })
+        .eq('booking_code', activeBooking.booking_code);
+
+      if (bookingError) {
+        throw bookingError;
+      }
+
+      // 2. Update status and occupied_until in Supabase rooms table
+      const checkoutTime = activeBooking.check_out ? `${activeBooking.check_out} 12:00:00` : null;
+      const { error: roomError } = await supabase
+        .from('rooms')
+        .update({ 
+          status: 'Occupied',
+          occupied_until: checkoutTime
+        })
+        .eq('id', roomObj.id);
+
+      if (roomError) {
+        throw roomError;
+      }
+
+      // Log activity
+      logActivity(
+        adminName,
+        currentRole,
+        `Melakukan CHECK-IN otomatis untuk Kamar No. ${roomObj.number} (Kode Booking: ${activeBooking.booking_code})`
+      );
+
+      // 3. Update local states so colors update instantly without reload!
+      setBookings(prev => prev.map(b => b.booking_code === activeBooking.booking_code ? { ...b, status: 'CheckedIn' as any } : b));
+      setDbRooms(prev => prev.map(r => r.id === roomObj.id ? { ...r, status: 'Occupied', occupied_until: checkoutTime } : r));
+
+      // Also update localStorage backups to keep in sync
+      const raw = localStorage.getItem('zegan_bookings');
+      if (raw) {
+        const localB = JSON.parse(raw);
+        const updatedB = localB.map((b: any) => b.booking_code === activeBooking.booking_code ? { ...b, status: 'CheckedIn' } : b);
+        localStorage.setItem('zegan_bookings', JSON.stringify(updatedB));
+      }
+
+      alert(lang === 'id'
+        ? `Berhasil Check-in untuk Kamar No. ${roomObj.number}!`
+        : `Successfully checked-in Room No. ${roomObj.number}!`
+      );
+    } catch (err: any) {
+      console.error('Error in handleCheckInBooking:', err);
+      alert(lang === 'id'
+        ? `Gagal melakukan Check-in: ${err.message || err}`
+        : `Failed to Check-in: ${err.message || err}`
+      );
+    } finally {
+      setLoadingRooms(prev => ({ ...prev, [roomObj.id]: false }));
     }
   };
 
@@ -134,13 +267,31 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
 
   // Manual status override toggler
   const handleManualStatusToggle = async (roomObj: any) => {
+    if (loadingRooms[roomObj.id]) return;
+
+    setLoadingRooms(prev => ({ ...prev, [roomObj.id]: true }));
     try {
-      const newStatus = roomObj.status === 'Available' ? 'Occupied' : 'Available';
+      const currentStatusInfo = getRoomColorStatus(roomObj);
+      const isCurrentlyAvailable = currentStatusInfo.status === 'Available';
+      
+      const newStatus = isCurrentlyAvailable ? 'Occupied' : 'Available';
+      let occupiedUntilVal = null;
+      
+      if (isCurrentlyAvailable) {
+        // Set occupied_until to tomorrow's checkout time 12:00:00
+        const tomorrow = new Date();
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const tomorrowStr = tomorrow.toISOString().substring(0, 10);
+        occupiedUntilVal = `${tomorrowStr} 12:00:00`;
+      }
 
       // Update in Supabase
       const { error } = await supabase
         .from('rooms')
-        .update({ status: newStatus })
+        .update({ 
+          status: newStatus,
+          occupied_until: occupiedUntilVal
+        })
         .eq('id', roomObj.id);
 
       if (error) {
@@ -154,13 +305,13 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
         `Mengubah status Kamar No. ${roomObj.number} secara manual menjadi ${newStatus === 'Available' ? 'Kosong (Available)' : 'Terisi (Occupied)'}`
       );
 
-      // Refresh room list state immediately
-      await fetchDbRooms();
+      // Update local dbRooms state immediately
+      setDbRooms(prev => prev.map(r => r.id === roomObj.id ? { ...r, status: newStatus, occupied_until: occupiedUntilVal } : r));
 
       // Update active selected room state so popup drawer updates immediately too
       setSelectedCalendarRoom((prev: any) => {
         if (!prev) return null;
-        const updatedRoom = { ...prev.room, status: newStatus };
+        const updatedRoom = { ...prev.room, status: newStatus, occupied_until: occupiedUntilVal };
         return {
           ...prev,
           room: updatedRoom,
@@ -170,6 +321,12 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
 
     } catch (err: any) {
       console.error('Error toggling room status:', err);
+      alert(lang === 'id'
+        ? `Gagal mengubah status kamar No. ${roomObj.number}: ${err.message || err}`
+        : `Failed to change room status for No. ${roomObj.number}: ${err.message || err}`
+      );
+    } finally {
+      setLoadingRooms(prev => ({ ...prev, [roomObj.id]: false }));
     }
   };
 
@@ -500,22 +657,57 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
   // Fetch active booking for calendar
   const getRoomActiveBooking = (roomNumber: string) => {
     const todayStr = new Date().toISOString().substring(0, 10);
+    const roomObj = dbRooms.find(r => r.number === roomNumber);
     return bookings.find(b => {
       if (b.status === 'Cancelled' || b.status === 'Expired') return false;
-      const isMyRoomNum = b.room_number === roomNumber || (!b.room_number && roomNumber === '1');
+      
+      const isMyRoom = (roomObj && b.room_id === roomObj.id) || 
+                       b.room_number === roomNumber || 
+                       (!b.room_number && roomNumber === '1');
+                       
       const isDateInRange = todayStr >= b.check_in && todayStr < b.check_out;
-      return isMyRoomNum && isDateInRange;
+      return isMyRoom && isDateInRange;
     }) || null;
   };
 
   // Get color status metadata for a room
   const getRoomColorStatus = (room: any) => {
-    const isAvailable = String(room.status).toLowerCase() === 'available';
-    if (isAvailable) {
-      return { status: 'Available', color: 'bg-emerald-600 text-emerald-50 ring-emerald-700', label: lang === 'id' ? 'Kosong' : 'Available' };
-    } else {
-      return { status: 'Occupied', color: 'bg-rose-600 text-rose-50 ring-rose-700', label: lang === 'id' ? 'Terisi' : 'Occupied' };
+    const activeBooking = getRoomActiveBooking(room.number);
+    const now = new Date();
+    
+    // 3. MERAH (Occupied) — kolom occupied_until di-set dan belum dilewati (atau booking_status === 'CheckedIn')
+    const hasOccupiedUntil = room.occupied_until && new Date(room.occupied_until) > now;
+    const hasCheckedInBooking = activeBooking && (
+      String(activeBooking.status).toLowerCase().replace(/[\s-_]/g, '') === 'checkedin'
+    );
+    const isLegacyOccupied = String(room.status).toLowerCase() === 'occupied' && !room.occupied_until;
+
+    if (hasOccupiedUntil || hasCheckedInBooking || isLegacyOccupied) {
+      return { 
+        status: 'Occupied', 
+        color: 'bg-rose-600 text-rose-50 ring-rose-700', 
+        label: lang === 'id' ? 'Terisi (Occupied)' : 'Occupied' 
+      };
     }
+
+    // 2. KUNING (Booked) — ada booking di tabel bookings untuk kamar ini, dengan booking_status "Pending" atau "Confirmed" (belum "CheckedIn"), dan tanggal hari ini ada di antara check_in dan check_out.
+    if (activeBooking) {
+      const bStatus = String(activeBooking.status).toLowerCase().replace(/[\s-_]/g, '');
+      if (bStatus === 'pending' || bStatus === 'confirmed' || bStatus === 'paid') {
+        return { 
+          status: 'Booked', 
+          color: 'bg-amber-500 text-amber-950 ring-amber-600', 
+          label: lang === 'id' ? 'Dipesan (Booked)' : 'Booked' 
+        };
+      }
+    }
+    
+    // 1. HIJAU (Available) — kolom rooms.occupied_until kosong (NULL), atau waktu sekarang sudah melewati nilai occupied_until.
+    return { 
+      status: 'Available', 
+      color: 'bg-emerald-600 text-emerald-50 ring-emerald-700', 
+      label: lang === 'id' ? 'Kosong' : 'Available' 
+    };
   };
 
   // Dashboard Stats Calculations
@@ -769,9 +961,10 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
               </div>
 
               {/* Legend */}
-              <div className="flex flex-wrap gap-3 text-[10px] font-bold uppercase tracking-wider text-stone-600">
+              <div className="flex flex-wrap gap-4 text-[10px] font-bold uppercase tracking-wider text-stone-600">
                 <div className="flex items-center gap-1.5"><span className="w-3 h-3 bg-emerald-600 rounded-sm"></span><span>{lang === 'id' ? 'Kosong (Available)' : 'Available'}</span></div>
-                <div className="flex items-center gap-1.5"><span className="w-3 h-3 bg-rose-600 rounded-sm"></span><span>{lang === 'id' ? 'Terisi (Occupied)' : 'Occupied'}</span></div>
+                <div className="flex items-center gap-1.5"><span className="w-3 h-3 bg-amber-500 rounded-sm"></span><span>{lang === 'id' ? 'Dipesan (Booked / Kuning)' : 'Booked'}</span></div>
+                <div className="flex items-center gap-1.5"><span className="w-3 h-3 bg-rose-600 rounded-sm"></span><span>{lang === 'id' ? 'Terisi (Occupied / CheckedIn)' : 'Occupied'}</span></div>
               </div>
 
               {/* The Room Boxes */}
@@ -779,46 +972,80 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
                 {calendarRoomsList.map((room) => {
                   const statusInfo = getRoomColorStatus(room);
                   const activeBooking = getRoomActiveBooking(room.number);
+                  const isLoading = !!loadingRooms[room.id];
 
                   return (
                     <motion.button
-                      whileHover={{ scale: 1.02 }}
+                      whileHover={isLoading ? {} : { scale: 1.02 }}
                       key={room.number}
                       onClick={() => {
-                        setSelectedCalendarRoom({ room, statusInfo, activeBooking });
-                        if (activeBooking) {
-                          setEditFormName(activeBooking.full_name);
-                          setEditFormPhone(activeBooking.phone);
-                          setEditFormCheckIn(activeBooking.check_in);
-                          setEditFormCheckOut(activeBooking.check_out);
+                        if (statusInfo.status === 'Booked' && activeBooking) {
+                          handleCheckInBooking(room, activeBooking);
+                        } else if (statusInfo.status === 'Available' || (statusInfo.status === 'Occupied' && !activeBooking)) {
+                          handleManualStatusToggle(room);
                         }
-                        setIsEditingBooking(false);
                       }}
-                      className={`h-40 rounded-2xl p-4 text-left border flex flex-col justify-between shadow-xs cursor-pointer transition-all ring-1 ${statusInfo.color}`}
+                      disabled={isLoading}
+                      className={`h-40 rounded-2xl p-4 text-left border flex flex-col justify-between shadow-xs cursor-pointer transition-all ring-1 ${statusInfo.color} ${isLoading ? 'opacity-50 pointer-events-none' : ''}`}
                     >
                       <div>
                         <div className="flex justify-between items-start">
                           <span className="text-base font-bold tracking-wide font-mono">No. {room.number}</span>
-                          <span className="text-[9px] font-extrabold uppercase tracking-widest bg-black/10 px-1.5 py-0.5 rounded-md leading-none">
-                            {statusInfo.label}
-                          </span>
+                          <div className="flex items-center gap-1">
+                            {/* Manage Button */}
+                            <button
+                              type="button"
+                              className="detail-btn hover:bg-black/20 text-white p-1 rounded-md transition-all cursor-pointer mr-0.5"
+                              onClick={(e) => {
+                                e.stopPropagation(); // Stop click from toggling status
+                                setSelectedCalendarRoom({ room, statusInfo, activeBooking });
+                                if (activeBooking) {
+                                  setEditFormName(activeBooking.full_name);
+                                  setEditFormPhone(activeBooking.phone);
+                                  setEditFormCheckIn(activeBooking.check_in);
+                                  setEditFormCheckOut(activeBooking.check_out);
+                                }
+                                setIsEditingBooking(false);
+                              }}
+                              title={lang === 'id' ? 'Kelola Detail Booking' : 'Manage Booking Details'}
+                            >
+                              <Settings className="w-3.5 h-3.5" />
+                            </button>
+                            <span className="text-[9px] font-extrabold uppercase tracking-widest bg-black/10 px-1.5 py-0.5 rounded-md leading-none">
+                              {isLoading ? '...' : statusInfo.label}
+                            </span>
+                          </div>
                         </div>
                         <span className="text-[10px] block opacity-90 mt-0.5 truncate">{room.type}</span>
                       </div>
 
                       <div>
                         {activeBooking ? (
-                          <div className="space-y-0.5 border-t border-white/20 pt-1.5 mt-1.5">
-                            <span className="text-[10px] font-bold block truncate">
-                              👤 {activeBooking.full_name}
-                            </span>
+                          <div className="space-y-1 border-t border-white/20 pt-1.5 mt-1.5">
+                            <div className="flex justify-between items-center gap-1">
+                              <span className="text-[10px] font-bold block truncate max-w-[90px]">
+                                👤 {activeBooking.full_name}
+                              </span>
+                              {statusInfo.status === 'Booked' && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleCheckInBooking(room, activeBooking);
+                                  }}
+                                  className="bg-white text-amber-950 hover:bg-amber-100 font-extrabold text-[9px] px-1.5 py-0.5 rounded-lg transition-all shadow-xs shrink-0 cursor-pointer uppercase tracking-wider"
+                                >
+                                  Check-in
+                                </button>
+                              )}
+                            </div>
                             <span className="text-[8.5px] opacity-90 block font-mono font-medium">
                               📅 In: {activeBooking.check_in}
                             </span>
                           </div>
                         ) : (
                           <span className="text-[10px] italic font-light opacity-90">
-                            {room.status === 'Available' ? (lang === 'id' ? 'Siap huni / kosong' : 'Ready / Kosong') : (lang === 'id' ? 'Terisi (Occupied)' : 'Occupied')}
+                            {isLoading ? (lang === 'id' ? 'Menyimpan...' : 'Saving...') : (room.status === 'Available' ? (lang === 'id' ? 'Siap huni / kosong' : 'Ready / Kosong') : (lang === 'id' ? 'Terisi (Occupied)' : 'Occupied'))}
                           </span>
                         )}
                       </div>
@@ -1115,9 +1342,10 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
                   <p className="text-xs text-stone-500 mt-0.5">Kondisi keterisian seluruh unit kamar hari ini.</p>
                 </div>
                 {/* Legenda warna */}
-                <div className="flex flex-wrap gap-3 text-[10px] font-bold uppercase tracking-wider text-stone-600">
+                <div className="flex flex-wrap gap-4 text-[10px] font-bold uppercase tracking-wider text-stone-600">
                   <div className="flex items-center gap-1.5"><span className="w-3 h-3 bg-emerald-600 rounded-sm"></span><span>{lang === 'id' ? 'Kosong (Available)' : 'Available'}</span></div>
-                  <div className="flex items-center gap-1.5"><span className="w-3 h-3 bg-rose-600 rounded-sm"></span><span>{lang === 'id' ? 'Terisi (Occupied)' : 'Occupied'}</span></div>
+                  <div className="flex items-center gap-1.5"><span className="w-3 h-3 bg-amber-500 rounded-sm"></span><span>{lang === 'id' ? 'Dipesan (Booked / Kuning)' : 'Booked'}</span></div>
+                  <div className="flex items-center gap-1.5"><span className="w-3 h-3 bg-rose-600 rounded-sm"></span><span>{lang === 'id' ? 'Terisi (Occupied / CheckedIn)' : 'Occupied'}</span></div>
                 </div>
               </div>
 
@@ -1126,29 +1354,49 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
                 {calendarRoomsList.map((room) => {
                   const statusInfo = getRoomColorStatus(room);
                   const activeBooking = getRoomActiveBooking(room.number);
+                  const isLoading = !!loadingRooms[room.id];
 
                   return (
                     <motion.button
-                      whileHover={{ scale: 1.03 }}
+                      whileHover={isLoading ? {} : { scale: 1.03 }}
                       key={room.number}
                       onClick={() => {
-                        setSelectedCalendarRoom({ room, statusInfo, activeBooking });
-                        if (activeBooking) {
-                          setEditFormName(activeBooking.full_name);
-                          setEditFormPhone(activeBooking.phone);
-                          setEditFormCheckIn(activeBooking.check_in);
-                          setEditFormCheckOut(activeBooking.check_out);
+                        if (statusInfo.status === 'Booked' && activeBooking) {
+                          handleCheckInBooking(room, activeBooking);
+                        } else if (statusInfo.status === 'Available' || (statusInfo.status === 'Occupied' && !activeBooking)) {
+                          handleManualStatusToggle(room);
                         }
-                        setIsEditingBooking(false);
                       }}
-                      className={`h-44 rounded-2xl p-5 text-left border flex flex-col justify-between shadow-sm cursor-pointer transition-all ring-1 ${statusInfo.color}`}
+                      disabled={isLoading}
+                      className={`h-44 rounded-2xl p-5 text-left border flex flex-col justify-between shadow-sm cursor-pointer transition-all ring-1 ${statusInfo.color} ${isLoading ? 'opacity-50 pointer-events-none' : ''}`}
                     >
                       <div>
                         <div className="flex justify-between items-start">
                           <span className="text-lg font-bold tracking-wide font-mono">No. {room.number}</span>
-                          <span className="text-[10px] font-extrabold uppercase tracking-widest bg-black/10 px-1.5 py-0.5 rounded-md">
-                            {statusInfo.label}
-                          </span>
+                          <div className="flex items-center gap-1.5">
+                            {/* Manage Button */}
+                            <button
+                              type="button"
+                              className="detail-btn hover:bg-black/20 text-white p-1 rounded-md transition-all cursor-pointer mr-0.5"
+                              onClick={(e) => {
+                                e.stopPropagation(); // Stop click from toggling status
+                                setSelectedCalendarRoom({ room, statusInfo, activeBooking });
+                                if (activeBooking) {
+                                  setEditFormName(activeBooking.full_name);
+                                  setEditFormPhone(activeBooking.phone);
+                                  setEditFormCheckIn(activeBooking.check_in);
+                                  setEditFormCheckOut(activeBooking.check_out);
+                                }
+                                setIsEditingBooking(false);
+                              }}
+                              title={lang === 'id' ? 'Kelola Detail Booking' : 'Manage Booking Details'}
+                            >
+                              <Settings className="w-4 h-4" />
+                            </button>
+                            <span className="text-[10px] font-extrabold uppercase tracking-widest bg-black/10 px-1.5 py-0.5 rounded-md">
+                              {isLoading ? '...' : statusInfo.label}
+                            </span>
+                          </div>
                         </div>
                         <span className="text-[11px] block opacity-85 mt-1 font-sans">{room.type}</span>
                       </div>
@@ -1156,18 +1404,32 @@ export default function AdminPortal({ lang, staffUser, initialTab, onLogout, onT
                       {/* Display guest name if occupied or booked */}
                       <div>
                         {activeBooking ? (
-                          <div className="space-y-0.5 border-t border-white/20 pt-2 mt-2">
+                          <div className="space-y-1 border-t border-white/20 pt-2 mt-2">
                             <span className="text-[10px] uppercase opacity-75 font-semibold block tracking-wider">Tamu Aktif</span>
-                            <span className="text-xs font-extrabold block truncate leading-tight">
-                              👤 {activeBooking.full_name}
-                            </span>
+                            <div className="flex justify-between items-center gap-1">
+                              <span className="text-xs font-extrabold block truncate max-w-[100px] leading-tight">
+                                👤 {activeBooking.full_name}
+                              </span>
+                              {statusInfo.status === 'Booked' && (
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    handleCheckInBooking(room, activeBooking);
+                                  }}
+                                  className="bg-white text-amber-950 hover:bg-amber-100 font-extrabold text-[10px] px-2 py-0.5 rounded-md transition-all shadow-sm shrink-0 cursor-pointer uppercase tracking-wider"
+                                >
+                                  Check-in
+                                </button>
+                              )}
+                            </div>
                             <span className="text-[9px] opacity-80 block font-mono font-medium">
                               📅 In: {activeBooking.check_in}
                             </span>
                           </div>
                         ) : (
                           <span className="text-[11px] italic font-light opacity-85">
-                            {room.status === 'Available' ? (lang === 'id' ? 'Siap huni / kosong' : 'Ready / Kosong') : (lang === 'id' ? 'Terisi (Occupied)' : 'Occupied')}
+                            {isLoading ? (lang === 'id' ? 'Menyimpan...' : 'Saving...') : (room.status === 'Available' ? (lang === 'id' ? 'Siap huni / kosong' : 'Ready / Kosong') : (lang === 'id' ? 'Terisi (Occupied)' : 'Occupied'))}
                           </span>
                         )}
                       </div>
